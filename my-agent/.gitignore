@@ -1,0 +1,8 @@
+__pycache__/
+*.py[codz]
+.env
+data/
+.tasks/
+.teams/
+.transcripts/
+.task_outputs/
