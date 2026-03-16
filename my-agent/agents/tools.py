@@ -1,6 +1,10 @@
 import os
 import subprocess
 from pathlib import Path
+from settings import client, MODEL
+
+SUBAGENT_SYSTEM = f"""You are a coding subagent at {os.getcwd()}.
+Complete the given task, then summarize your findings."""
 
 TOOL_HANDLERS = {
     "bash": lambda command, **_:run_bash(command),
@@ -8,9 +12,10 @@ TOOL_HANDLERS = {
     "write_file": lambda path, content, **_:write_file(path, content),
     "edit_file": lambda path, old_text, new_text, **_:edit_file(path, old_text, new_text),
     "todo": lambda items, **_:TODO.update(items),
+    "task": lambda prompt, **_:run_subagent(prompt),
 }
 
-TOOLS = [
+CHILD_AGENT_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -23,7 +28,35 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
 ]
 
+PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
+    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+]
+
 TODO = None  # global singleton, initialized below
+
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+            tools=CHILD_AGENT_TOOLS, max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": results})
+    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
 
 class TodoManager:
     def __init__(self):

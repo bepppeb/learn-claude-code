@@ -26,18 +26,8 @@ policy, hooks, and lifecycle controls on top.
 import os
 import readline  # noqa: F401 — enables arrow keys and history in input()
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
-
 import tools
-
-load_dotenv(override=True)
-
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+from settings import client, MODEL
 
 SYSTEM = f"""You are a coding agent at {os.getcwd()}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
@@ -48,7 +38,7 @@ Prefer tools over prose."""
 def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
-        response = client.messages.create(messages=messages, model=MODEL, system=SYSTEM, tools=tools.TOOLS, max_tokens=8000)
+        response = client.messages.create(messages=messages, model=MODEL, system=SYSTEM, tools=tools.PARENT_AGENT_TOOLS, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
