@@ -39,37 +39,37 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent at {os.getcwd()}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
 
-TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-]
 
 
 def agent_loop(messages: list):
+    rounds_since_todo = 0
     while True:
-        response = client.messages.create(messages=messages, model=MODEL, system=SYSTEM, tools=TOOLS, max_tokens=8000)
-        # import json
-        # print(json.dumps(response.model_dump(), indent=2, ensure_ascii=False))
+        response = client.messages.create(messages=messages, model=MODEL, system=SYSTEM, tools=tools.TOOLS, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
         results = []
+        used_todo = False
         for block in response.content:
             if block.type == "tool_use":
                 if "command" in block.input:
                     print(f"\033[33m$ {block.input['command']}\033[0m")
                 handler = tools.TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}: {output[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                print(f"> {block.name}: {str(output)[:200]}")
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                if block.name == "todo":
+                    used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
 
 if __name__ == "__main__":
