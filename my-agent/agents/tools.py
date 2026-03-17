@@ -1,8 +1,75 @@
+import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from settings import client, MODEL
 import re
+
+THRESHOLD = 50000
+KEEP_RECENT = 3
+TRANSCRIPT_DIR = Path.cwd() / ".transcripts"
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+
+def micro_compact(messages: list):
+    """Layer 1: Replace old tool_result content with short placeholders.
+    Runs every turn, keeps only the last KEEP_RECENT results intact."""
+    # Collect all tool_result entries with their positions
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for part_idx, part in enumerate(msg["content"]):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((msg_idx, part_idx, part))
+    if len(tool_results) <= KEEP_RECENT:
+        return
+    # Build tool_use_id -> tool_name map from assistant messages
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_name_map[block.id] = block.name
+    # Replace old results with placeholders
+    for _, _, result in tool_results[:-KEEP_RECENT]:
+        if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+            tool_id = result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            result["content"] = f"[Previous: used {tool_name}]"
+
+def auto_compact(messages: list) -> list:
+    """Layer 2: Save full transcript to disk, then LLM-summarize and replace all messages."""
+    # Save full transcript
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # Ask LLM to summarize
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        max_tokens=2000,
+    )
+    summary = next((b.text for b in response.content if hasattr(b, "text")), "No summary generated.")
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
+
 
 SUBAGENT_SYSTEM = f"""You are a coding subagent at {os.getcwd()}.
 Complete the given task, then summarize your findings."""
@@ -15,6 +82,7 @@ TOOL_HANDLERS = {
     "todo": lambda items, **_:TODO.update(items),
     "task": lambda prompt, **_:run_subagent(prompt),
     "load_skill": lambda name, **_:SKILL_LOADER.get_content(name),
+    "compact": lambda **_:"Manual compression requested.",
 }
 
 CHILD_AGENT_TOOLS = [
@@ -30,6 +98,8 @@ CHILD_AGENT_TOOLS = [
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
     {"name": "load_skill", "description": "Load specialized knowledge by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
+    {"name": "compact", "description": "Trigger manual conversation compression to free up context space.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
 ]
 
 PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [

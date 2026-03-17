@@ -1,3 +1,32 @@
+# Response 结构参考
+
+```
+response (Message)
+├── id: "msg_..."
+├── model: "MiniMax-M2.5"
+├── role: "assistant"
+├── stop_reason: "end_turn" | "tool_use"
+├── usage: Usage(input_tokens=44, output_tokens=90)
+└── content: list
+      ├── [0] ThinkingBlock          ← 模型思考过程（开启 extended thinking 时出现）
+      │        .type = "thinking"
+      │        .thinking = "..."     ← 思考内容
+      │        （没有 .text 属性）
+      └── [1] TextBlock              ← 实际回复
+               .type = "text"
+               .text = "..."         ← 回复文本
+      └── [?] ToolUseBlock           ← 工具调用（stop_reason == "tool_use" 时出现）
+               .type = "tool_use"
+               .id = "tu_..."
+               .name = "bash"
+               .input = {"command": "ls"}
+```
+
+> 注意：开启 extended thinking 时，content[0] 是 ThinkingBlock 不是 TextBlock。
+> 取文本应遍历查找：`next((b.text for b in response.content if hasattr(b, "text")), None)`
+
+---
+
 # 从零实现类 Claude Code 智能体 -- 学习指南
 
 本指南配合 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 项目使用。每一步给出**目标、思路和测试方案**，不包含具体代码。你需要独立思考实现方式，遇到困难时可参考 `agents/` 目录下的参考实现和 `docs/zh/` 下的详细文档。
