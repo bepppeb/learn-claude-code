@@ -2,6 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 from settings import client, MODEL
+import re
 
 SUBAGENT_SYSTEM = f"""You are a coding subagent at {os.getcwd()}.
 Complete the given task, then summarize your findings."""
@@ -13,6 +14,7 @@ TOOL_HANDLERS = {
     "edit_file": lambda path, old_text, new_text, **_:edit_file(path, old_text, new_text),
     "todo": lambda items, **_:TODO.update(items),
     "task": lambda prompt, **_:run_subagent(prompt),
+    "load_skill": lambda name, **_:SKILL_LOADER.get_content(name),
 }
 
 CHILD_AGENT_TOOLS = [
@@ -26,6 +28,8 @@ CHILD_AGENT_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+    {"name": "load_skill", "description": "Load specialized knowledge by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]
 
 PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
@@ -34,6 +38,56 @@ PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
 ]
 
 TODO = None  # global singleton, initialized below
+
+class SKILL_LOADER:
+    def __init__(self, skills_dir: Path):
+        print(f"Loading skills from {skills_dir}")
+        self.skills = {}
+        self.skills_dir = skills_dir
+        self._load_all()
+    
+    def _load_all(self):
+        if not self.skills_dir.exists():
+            print(f"Skills directory {self.skills_dir} does not exist")
+            return
+        for f in sorted(self.skills_dir.rglob("SKILL.md")):
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            name = meta.get("name", f.parent.name)
+            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+
+    
+    def _parse_frontmatter(self, text: str) -> tuple:
+        """Parse YAML frontmatter between --- delimiters."""
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ":" in line:
+                key, val = line.split(":", 1)
+                meta[key.strip()] = val.strip()
+        return meta, match.group(2).strip()
+    
+    def get_descriptions(self) -> str:
+        if not self.skills:
+            print("No skills loaded")
+            return "(no skills available)"
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f"  - {name}: {desc}"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+    
+    def get_content(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
 
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]
@@ -144,5 +198,6 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 TODO = TodoManager()
-
+SKILLS_DIR = Path(os.getcwd()) / "skills"
+SKILL_LOADER = SKILL_LOADER(SKILLS_DIR) 
 

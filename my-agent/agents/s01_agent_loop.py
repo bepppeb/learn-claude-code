@@ -31,7 +31,12 @@ from settings import client, MODEL
 
 SYSTEM = f"""You are a coding agent at {os.getcwd()}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Prefer tools over prose."""
+Prefer tools over prose.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics
+
+Skills available:
+{tools.SKILL_LOADER.get_descriptions()}
+"""
 
 
 
