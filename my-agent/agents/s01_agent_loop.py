@@ -30,9 +30,10 @@ import tools
 from settings import client, MODEL
 
 SYSTEM = f"""You are a coding agent at {os.getcwd()}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Use task_create/task_update/task_list for multi-step work — tasks persist to disk and survive compression.
+Use the todo tool for quick in-memory checklists within a single session.
 Prefer tools over prose.
-Use load_skill to access specialized knowledge before tackling unfamiliar topics
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
 Skills available:
 {tools.SKILL_LOADER.get_descriptions()}
