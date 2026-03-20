@@ -50,6 +50,13 @@ def agent_loop(messages: list):
         if tools.estimate_tokens(messages) > tools.THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = tools.auto_compact(messages)
+        # Drain background task notifications
+        notifications = tools.BG.drain_notifications()
+        if notifications:
+            note_text = "<background-results>\n" + "\n---\n".join(notifications) + "\n</background-results>"
+            messages.append({"role": "user", "content": note_text})
+            messages.append({"role": "assistant", "content": "Noted. Background tasks completed."})
+            print(f"[background: {len(notifications)} notification(s) injected]")
         response = client.messages.create(messages=messages, model=MODEL, system=SYSTEM, tools=tools.PARENT_AGENT_TOOLS, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":

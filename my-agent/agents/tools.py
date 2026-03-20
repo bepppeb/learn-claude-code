@@ -1,7 +1,10 @@
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
+import uuid
 from pathlib import Path
 from settings import client, MODEL
 import re
@@ -87,6 +90,8 @@ TOOL_HANDLERS = {
     "task_update": lambda task_id, status=None, addBlockedBy=None, addBlocks=None, **_: TASKS.update(task_id, status, addBlockedBy, addBlocks),
     "task_list": lambda **_: TASKS.list_all(),
     "task_get": lambda task_id, **_: TASKS.get(task_id),
+    "background_run": lambda command, **_: BG.run(command),
+    "check_background": lambda task_id=None, **_: BG.check(task_id),
 }
 
 CHILD_AGENT_TOOLS = [
@@ -117,6 +122,10 @@ CHILD_AGENT_TOOLS = [
 PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+    {"name": "background_run", "description": "Run a shell command in the background (non-blocking). Returns a task ID immediately.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to run in background"}}, "required": ["command"]}},
+    {"name": "check_background", "description": "Check status and output of background tasks. Pass task_id for details, or omit for overview.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Background task ID to check (omit for all)"}}}},
 ]
 
 TODO = None  # global singleton, initialized below
@@ -313,6 +322,83 @@ class TodoManager:
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
+
+class BackgroundManager:
+    """Non-blocking command execution via daemon threads."""
+
+    def __init__(self, timeout: int = 300):
+        self.timeout = timeout
+        self._tasks: dict[str, dict] = {}
+        self._notifications: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+
+    def run(self, command: str) -> str:
+        task_id = uuid.uuid4().hex[:8]
+        task = {
+            "id": task_id, "command": command,
+            "status": "running", "output": "", "start_time": time.time(),
+        }
+        with self._lock:
+            self._tasks[task_id] = task
+        t = threading.Thread(target=self._execute, args=(task_id, command), daemon=True)
+        t.start()
+        return f"Background task {task_id} started: {command}"
+
+    def _execute(self, task_id: str, command: str):
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=os.getcwd(),
+                capture_output=True, text=True, timeout=self.timeout,
+            )
+            output = (r.stdout + r.stderr).strip() or "(no output)"
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = f"Error: Timeout ({self.timeout}s)"
+            status = "error"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        with self._lock:
+            self._tasks[task_id]["status"] = status
+            self._tasks[task_id]["output"] = output
+        # Push truncated notification to queue
+        preview = output[:500] + ("..." if len(output) > 500 else "")
+        self._notifications.put(
+            f"[bg:{task_id}] `{command}` → {status}\n{preview}"
+        )
+
+    def check(self, task_id: str = None) -> str:
+        with self._lock:
+            if task_id:
+                task = self._tasks.get(task_id)
+                if not task:
+                    return f"Error: No background task with id {task_id}"
+                elapsed = time.time() - task["start_time"]
+                return (
+                    f"id: {task_id}\ncommand: {task['command']}\n"
+                    f"status: {task['status']}\nelapsed: {elapsed:.1f}s\n"
+                    f"output:\n{task['output'][:50000]}"
+                )
+            if not self._tasks:
+                return "No background tasks."
+            lines = []
+            for tid, t in self._tasks.items():
+                elapsed = time.time() - t["start_time"]
+                lines.append(f"  {tid}: [{t['status']}] {t['command']} ({elapsed:.1f}s)")
+            return "\n".join(lines)
+
+    def drain_notifications(self) -> list[str]:
+        results = []
+        while not self._notifications.empty():
+            try:
+                results.append(self._notifications.get_nowait())
+            except queue.Empty:
+                break
+        return results
+
+
+BG = BackgroundManager()
+
 
 def safe_path(path: str) -> Path:
     path = (Path(os.getcwd()) / path).resolve()
