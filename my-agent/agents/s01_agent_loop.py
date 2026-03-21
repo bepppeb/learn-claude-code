@@ -23,17 +23,19 @@ until the model decides to stop. Production agents layer
 policy, hooks, and lifecycle controls on top.
 """
 
+import json
 import os
 import readline  # noqa: F401 — enables arrow keys and history in input()
 
 import tools
 from settings import client, MODEL
 
-SYSTEM = f"""You are a coding agent at {os.getcwd()}.
+SYSTEM = f"""You are a team lead at {os.getcwd()}.
 Use task_create/task_update/task_list for multi-step work — tasks persist to disk and survive compression.
 Use the todo tool for quick in-memory checklists within a single session.
 Prefer tools over prose.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+Spawn teammates for parallel work. Communicate via send_message/read_inbox/broadcast.
 
 Skills available:
 {tools.SKILL_LOADER.get_descriptions()}
@@ -50,6 +52,19 @@ def agent_loop(messages: list):
         if tools.estimate_tokens(messages) > tools.THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = tools.auto_compact(messages)
+        # s09: 每轮 LLM 调用前 drain lead 收件箱，将队友消息注入上下文
+        # 用 <inbox> 标签包裹，让 LLM 明确区分这是收件箱消息而非用户输入
+        # 伪造 assistant 回复保证 user/assistant 交替（API 要求）
+        inbox = tools.BUS.read_inbox("lead")
+        if inbox:
+            messages.append({
+                "role": "user",
+                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
+            })
+            messages.append({
+                "role": "assistant",
+                "content": "Noted inbox messages.",
+            })
         # Drain background task notifications
         notifications = tools.BG.drain_notifications()
         if notifications:
@@ -105,6 +120,12 @@ if __name__ == "__main__":
                 print("[manual compact done]")
             else:
                 print("Nothing to compact.")
+            continue
+        if query.strip() == "/team":  # s09: 调试命令，直接查看团队名册，不经过 LLM
+            print(tools.TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":  # s09: 调试命令，手动检查 lead 收件箱
+            print(json.dumps(tools.BUS.read_inbox("lead"), indent=2))
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
