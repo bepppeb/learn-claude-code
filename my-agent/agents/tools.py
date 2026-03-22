@@ -1,3 +1,36 @@
+"""
+tools.py — Agent 工具集
+
+本文件包含 agent 可用的所有工具实现，按功能分为几大模块：
+
+1. 团队协作（s10 新增）
+   - MessageBus      — 基于 JSONL 文件的异步消息系统
+   - TeammateManager — 队友生命周期管理（spawn/idle/shutdown）
+   核心设计：队友在独立线程中运行完整的 agent loop，通过邮箱与 lead 通信
+
+2. 上下文管理
+   - micro_compact   — 细粒度压缩：替换旧 tool_result 为占位符
+   - auto_compact    — 粗粒度压缩：LLM 摘要替换全部对话历史
+   - estimate_tokens — 粗略 token 计数
+
+3. 任务管理
+   - TaskManager     — 持久化任务 DAG（.tasks/ 目录）
+   - TodoManager     — 内存中的轻量待办列表
+   - BackgroundManager — 非阻塞后台命令执行
+
+4. 基础工具
+   - bash/read_file/write_file/edit_file — 文件系统和 shell 操作
+   - run_subagent    — 一次性子智能体（与队友不同：同步阻塞，用完即弃）
+
+5. 技能系统
+   - SKILL_LOADER    — 从 skills/ 目录加载 SKILL.md 文件
+
+工具注册：
+   - TOOL_HANDLERS   — name → handler 映射，lead 的工具分发表
+   - CHILD_AGENT_TOOLS — 子智能体/队友的工具 schema 列表
+   - PARENT_AGENT_TOOLS — lead 的完整工具 schema 列表
+"""
+
 import json
 import os
 import queue
@@ -9,36 +42,96 @@ from pathlib import Path
 from settings import client, MODEL
 import re
 
+# 上下文压缩阈值：粗略估算 token 数超过此值时触发 auto_compact
+# 计算方式：len(str(messages)) // 4（约 4 字符 = 1 token）
+# 50000 token ≈ 200K 字符，为 200K 上下文窗口留出足够的回复空间
 THRESHOLD = 50000
 
-# -- s09: Agent Teams --
+# ============================================================
+# 团队协作系统 (s10)
+# ============================================================
+#
+# 整体架构：
+#   Lead agent 是"团队领导"，可以 spawn 多个 teammate（队友）
+#   每个队友在独立 daemon 线程中运行自己的 agent loop（有完整 LLM 推理能力）
+#   lead 和队友之间通过基于 JSONL 文件的"邮箱"系统异步通信
+#
+# 文件系统布局：
+#   .team/
+#     config.json          — 团队名册（所有队友的 name/role/status）
+#     inbox/
+#       lead.jsonl         — lead 的收件箱
+#       alice.jsonl        — 队友 alice 的收件箱
+#       bob.jsonl          — 队友 bob 的收件箱
+#
+# 与 s04 子智能体（subagent）的对比：
+#   子智能体：run_subagent() 同步阻塞，共享 TOOL_HANDLERS，用完即弃
+#   队友：    threading.Thread 异步执行，有独立工具集，有持久身份和生命周期
+
 # 团队数据根目录，存 config.json（团队名册）
 TEAM_DIR = Path.cwd() / ".team"
 # 收件箱目录，每个队友一个 .jsonl 文件（如 alice.jsonl, bob.jsonl）
 INBOX_DIR = TEAM_DIR / "inbox"
 
-# 5 种消息类型，s09 只用前两种，后三种为 s10（团队协议）预留
+# 消息类型白名单
 VALID_MSG_TYPES = {
-    "message",                  # 普通点对点消息
-    "broadcast",                # 群发消息
-    "shutdown_request",         # 请求队友关机（s10）
-    "shutdown_response",        # 队友回复关机请求（s10）
-    "plan_approval_response",   # 计划审批回复（s10）
+    "message",                  # 普通点对点消息（lead ↔ teammate）
+    "broadcast",                # 群发消息（lead → all teammates）
+    "shutdown_request",         # lead 请求队友主动关机（s10 协议）
+    "shutdown_response",        # 队友确认/拒绝关机（s10 协议）
+    "plan_approval_response",   # lead 对队友计划的审批回复（s10 协议）
 }
+
+# ============================================================
+# 请求跟踪器 (s10 Team Protocols)
+# ============================================================
+#
+# 两种协议共用同一个 request_id 关联模式：
+#
+# 1. Shutdown 协议 (Lead → Teammate)：
+#    Lead 发 shutdown_request{request_id} → Teammate 回 shutdown_response{request_id, approve}
+#    FSM: pending → approved | rejected
+#
+# 2. Plan Approval 协议 (Teammate → Lead)：
+#    Teammate 发 plan_approval{request_id, plan} → Lead 回 plan_approval_response{request_id, approve}
+#    FSM: pending → approved | rejected
+
+shutdown_requests: dict[str, dict] = {}  # {request_id: {"target": name, "status": "pending|approved|rejected"}}
+plan_requests: dict[str, dict] = {}      # {request_id: {"from": name, "plan": text, "status": "pending|approved|rejected"}}
+_tracker_lock = threading.Lock()          # 保护上述两个字典的并发访问（lead 线程和队友线程都可能读写）
 
 
 class MessageBus:
-    """基于 JSONL 的邮箱系统。send() 追加一行 JSON；read_inbox() 读取全部并清空。
-    每个收件箱一把锁，保证 send() 和 read_inbox() 不会并发操作同一个文件。"""
+    """基于 JSONL 文件的异步消息总线。
+
+    设计选择：为什么用文件而不用内存队列？
+    1. 持久化：进程崩溃后消息不丢失
+    2. 可观测：直接 cat inbox/alice.jsonl 就能看到未读消息
+    3. 简单：不需要额外的消息中间件
+
+    并发安全模型：
+    - 每个收件箱（即每个 .jsonl 文件）有独立的 threading.Lock
+    - send() 和 read_inbox() 在操作同一个收件箱时互斥
+    - 不同收件箱的操作完全并行（alice 的锁不影响 bob 的锁）
+
+    消息格式（每行一个 JSON）：
+    {"type": "message", "from": "lead", "content": "请开始工作", "timestamp": 1711123456.789}
+    """
 
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)  # 启动时确保 inbox 目录存在
-        self._locks: dict[str, threading.Lock] = {}   # 每个收件箱一把锁
-        self._meta_lock = threading.Lock()             # 保护 _locks 字典本身的并发访问
+        self._locks: dict[str, threading.Lock] = {}   # name → Lock，每个收件箱一把锁
+        self._meta_lock = threading.Lock()             # 保护 _locks 字典本身的并发访问（创建新锁时）
 
     def _get_lock(self, name: str) -> threading.Lock:
-        """获取指定收件箱的锁，不存在则创建（双重检查锁定）。"""
+        """获取指定收件箱的锁，不存在则惰性创建。
+
+        使用双重检查锁定（Double-Checked Locking）模式：
+        1. 先无锁检查 _locks 字典（快速路径，绝大多数调用走这里）
+        2. 不存在时才加 _meta_lock 创建新锁
+        3. 加锁后再检查一次，防止两个线程同时通过第一步检查
+        """
         if name not in self._locks:
             with self._meta_lock:
                 if name not in self._locks:
@@ -47,8 +140,20 @@ class MessageBus:
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
-        """向收件人的 JSONL 文件追加一条消息。加锁防止与同一收件箱的 read_inbox 竞态。"""
-        if msg_type not in VALID_MSG_TYPES:  # 校验消息类型合法性
+        """向收件人的 JSONL 文件追加一条消息。
+
+        Args:
+            sender:   发送者名字（lead 或队友名）
+            to:       收件人名字（会映射到 inbox/{to}.jsonl 文件）
+            content:  消息正文
+            msg_type: 消息类型，必须在 VALID_MSG_TYPES 中
+            extra:    可选的扩展字段字典（如 plan_id），直接合并到消息 JSON 中
+
+        并发安全：按收件人加锁（_get_lock(to)），确保：
+        - 多个线程同时给同一个人发消息时，追加操作不会交错
+        - send 和 read_inbox 操作同一个收件箱时互斥
+        """
+        if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
             "type": msg_type,
@@ -56,17 +161,26 @@ class MessageBus:
             "content": content,
             "timestamp": time.time(),  # Unix 时间戳，方便排序和调试
         }
-        if extra:              # s10 用的扩展字段（如 plan_id）
+        if extra:              # 扩展字段（如 plan_id），直接合并到消息对象中
             msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"  # 收件人的邮箱文件
         with self._get_lock(to):               # 按收件人加锁，不同收件箱互不阻塞
-            with open(inbox_path, "a") as f:
+            with open(inbox_path, "a") as f:    # 追加模式写入
                 f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
-        """读取并清空收件箱（drain-on-read）。加锁保证 读取+清空 是原子的，
-        不会丢失在两步之间写入的消息。"""
+        """读取并清空收件箱（drain-on-read 语义）。
+
+        关键设计：读取和清空是在同一把锁内完成的原子操作。
+        如果不加锁，可能出现：
+          1. read_inbox 读取文件内容
+          2. 另一个线程的 send() 追加了新消息
+          3. read_inbox 清空文件 → 第 2 步的消息丢失了
+
+        返回值：消息列表（可能为空），每条消息是一个 dict
+        副作用：收件箱文件被清空（write_text("")）
+        """
         inbox_path = self.dir / f"{name}.jsonl"
         with self._get_lock(name):             # 与 send(to=name) 互斥
             if not inbox_path.exists():        # 从未收到过消息
@@ -79,54 +193,138 @@ class MessageBus:
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
-        """群发消息给所有队友（跳过发送者自己），复用 send()。"""
+        """群发消息给所有队友（跳过发送者自己）。
+
+        实现方式：遍历队友列表，逐个调用 send()。
+        每次 send() 都会独立加锁，所以不同队友的收件箱可以并行写入。
+        消息类型固定为 "broadcast"，让队友能区分这是群发还是定向消息。
+        """
         count = 0
         for name in teammates:
-            if name != sender:  # 不给自己发
+            if name != sender:  # 不给自己发（lead broadcast 时跳过 lead 自己）
                 self.send(sender, name, content, "broadcast")
                 count += 1
         return f"Broadcast to {count} teammates"
 
 
-BUS = MessageBus(INBOX_DIR)  # 全局单例，所有地方共用同一个消息总线
+# 全局消息总线单例
+# 所有地方（lead 的 TOOL_HANDLERS、队友的 _exec、agent_loop 的 inbox drain）都使用同一个实例
+BUS = MessageBus(INBOX_DIR)
+
+
+# ============================================================
+# s10 协议处理函数（Lead 端）
+# ============================================================
+
+def handle_shutdown_request(teammate: str) -> str:
+    """Lead 发起关机请求。生成 request_id，记录到 shutdown_requests 跟踪器，
+    并通过 MessageBus 发送 shutdown_request 消息给目标队友。
+    队友收到后可以通过 shutdown_response 工具回复 approve/reject。"""
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead", teammate, "Please shut down gracefully.",
+        "shutdown_request", {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审批队友提交的计划。通过 request_id 关联到原始请求，
+    更新 plan_requests 跟踪器状态，并发送审批结果给队友。"""
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lead", req["from"], feedback, "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+
+def check_shutdown_status(request_id: str) -> str:
+    """Lead 查看关机请求的当前状态（pending/approved/rejected）。"""
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
+def args_approve(input_dict: dict) -> bool:
+    """从工具参数中提取 approve 字段。用于 _teammate_loop 中检测 shutdown_response。"""
+    return input_dict.get("approve", False)
 
 
 class TeammateManager:
-    """持久化队友管理器。通过 config.json 维护团队名册，spawn() 在线程中启动完整 agent loop。
+    """持久化队友管理器。维护团队名册（config.json）并在线程中运行队友 agent loop。
 
-    与 s04 子智能体的区别：
-    - 子智能体（s04）：同步调用，阻塞等结果，用完即弃
-    - 队友（s09）：异步线程，通过邮箱通信，有持久身份和生命周期
+    队友生命周期：
+      spawn()     → status="working"  → 线程启动，进入 _teammate_loop
+      正常结束    → status="idle"     → 可被再次 spawn（允许换角色）
+      主动关机    → status="shutdown" → 不会被自动改为 idle
+
+    与 s04 子智能体（subagent）的本质区别：
+      子智能体：run_subagent() 同步调用，阻塞 lead，用完即弃，共享 TOOL_HANDLERS
+      队友：    threading.Thread 异步执行，不阻塞 lead，有独立身份和持久状态
+              通过 MessageBus 通信，有自己的工具集（_teammate_tools）
+
+    线程模型：
+      每个队友在一个 daemon=True 的线程中运行
+      daemon=True 意味着主进程退出时线程自动终止（不会卡住）
+      线程之间通过文件系统（MessageBus）通信，无内存共享
     """
 
     def __init__(self, team_dir: Path):
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"  # 团队名册文件
-        self.config = self._load_config()             # 从磁盘恢复上次的名册
-        self.threads = {}                             # name → Thread，用于跟踪
+        self.config_path = self.dir / "config.json"  # 团队名册文件路径
+        self.config = self._load_config()             # 从磁盘恢复上次的名册（支持跨会话）
+        self.threads = {}                             # name → Thread，仅用于本次会话的线程跟踪
 
     def _load_config(self) -> dict:
+        """从磁盘加载团队名册。首次运行时返回空名册模板。
+        名册格式：{"team_name": "default", "members": [{"name": ..., "role": ..., "status": ...}, ...]}
+        """
         if self.config_path.exists():
-            return json.loads(self.config_path.read_text())  # 恢复上次的名册
-        return {"team_name": "default", "members": []}       # 首次运行，空名册
+            return json.loads(self.config_path.read_text())
+        return {"team_name": "default", "members": []}
 
     def _save_config(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))  # 写盘持久化
+        """将当前名册写入磁盘（config.json），确保跨会话持久化。"""
+        self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
-        """线性扫描查找队友。返回 list 中的引用，修改会直接生效。"""
+        """在名册中按名字查找队友。
+        返回值是 list 中元素的引用（不是拷贝），修改返回值会直接修改名册。
+        这是有意为之的设计，方便 spawn() 和 _teammate_loop() 直接更新状态。
+        """
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
-        """创建队友并在独立线程中启动 agent loop。idle/shutdown 的队友可重新激活。"""
+        """创建队友并在独立线程中启动 agent loop。
+
+        Args:
+            name:   队友名字（唯一标识，也是收件箱文件名：inbox/{name}.jsonl）
+            role:   角色描述（如 "researcher"、"code reviewer"），会写入 system prompt
+            prompt: 初始任务描述，作为队友 agent loop 的第一条 user 消息
+
+        状态转换：
+            (不存在) → working  — 全新队友，加入名册并启动
+            idle     → working  — 空闲队友被重新激活（可换角色）
+            shutdown → working  — 已关机的队友被重新激活
+            working  → Error    — 正在工作的队友不能重复 spawn
+
+        返回值：成功返回确认消息，失败返回 Error 字符串
+        """
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
-                return f"Error: '{name}' is currently {member['status']}"  # 正在工作，拒绝
+                return f"Error: '{name}' is currently {member['status']}"
             # idle 或 shutdown 的队友可以重新激活，允许换角色
             member["status"] = "working"
             member["role"] = role
@@ -135,29 +333,64 @@ class TeammateManager:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()  # 持久化到 config.json
+
+        # 在独立 daemon 线程中启动队友的 agent loop
+        # daemon=True 确保主进程退出时线程不会阻塞
         thread = threading.Thread(
-            target=self._teammate_loop,  # 线程入口：完整的 agent loop（有 LLM 推理能力）
+            target=self._teammate_loop,
             args=(name, role, prompt),
-            daemon=True,                 # daemon=True：主进程退出时自动终止
+            daemon=True,
         )
         self.threads[name] = thread
-        thread.start()  # 立即返回，不阻塞 lead
+        thread.start()  # 非阻塞：立即返回，lead 可以继续工作
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        """队友的 agent loop，与 lead 结构相同：LLM 调用 → 工具执行 → 循环。
-        每轮开头 drain 自己的收件箱，将消息注入上下文。"""
+        """队友的完整 agent loop（在独立线程中运行）。
+
+        与 lead 的 agent_loop 结构相同：
+          while True:
+              response = LLM(messages, tools)
+              execute tools
+              append results
+
+        关键差异：
+        1. 独立的 messages[] — 不污染 lead 的对话历史
+        2. 精简的工具集 — 8 个工具（4 基础 + 2 通信 + 2 协议），没有 spawn_teammate/broadcast
+        3. 最多 50 轮 — 硬性上限防止失控（lead 没有此限制，靠 stop_reason 自然结束）
+        4. 每轮开头 drain 自己的收件箱 — 接收 lead 或其他队友的消息
+        5. 没有 micro_compact/auto_compact — 队友生命周期短，不需要压缩
+        6. should_exit 标志 — 队友批准 shutdown 后，完成当前轮次的 tool_result 提交后退出
+        """
+        # 每个队友有独立的 system prompt，包含自己的名字和角色
+        # s10: 告知队友两个协议：提交计划需审批，收到 shutdown_request 需回复
         sys_prompt = (
-            f"You are '{name}', role: {role}, at {Path.cwd()}. "  # 每个队友有独立身份
-            f"Use send_message to communicate. Complete your task."
+            f"You are '{name}', role: {role}, at {Path.cwd()}. "
+            f"Submit plans via plan_approval before major work. "
+            f"Respond to shutdown_request with shutdown_response."
         )
-        messages = [{"role": "user", "content": prompt}]  # 独立的 messages[]，不污染 lead
-        tools = self._teammate_tools()                     # 队友工具集（6 个，比 lead 少）
-        for _ in range(50):                                # 最多 50 轮，防止无限循环
-            # 每轮开头检查收件箱，将收到的消息注入上下文
+        messages = [{"role": "user", "content": prompt}]  # 独立对话历史，初始消息就是任务
+        tools = self._teammate_tools()                     # 精简工具集（8 个）
+
+        # s10: should_exit 标志 — 队友调用 shutdown_response(approve=True) 后设置
+        # 不立即 break，而是先让当前轮次的所有 tool_result 正常提交给 LLM
+        # 然后在下一轮循环开头 break（这样 LLM 能看到 shutdown_response 的结果）
+        should_exit = False
+
+        for _ in range(50):  # 硬性上限：最多 50 轮 LLM 调用
+            # -- 收件箱检查 --
+            # 每轮开头 drain 自己的收件箱
+            # 注意：这里直接追加为 user 消息，没有像 lead 那样用 <inbox> 标签包裹
+            # 因为队友的上下文更简单，不需要额外区分
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+
+            # s10: 如果上一轮已经批准了 shutdown，在处理完收件箱后退出
+            if should_exit:
+                break
+
+            # -- LLM 调用 --
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -166,32 +399,55 @@ class TeammateManager:
                     tools=tools,
                     max_tokens=8000,
                 )
-            except Exception:  # API 异常则退出循环
+            except Exception:  # API 异常（网络错误、限流等）则安全退出
                 break
+
             messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":  # 模型决定停下来
+
+            # 模型返回纯文本（不再调用工具）→ 任务完成，退出循环
+            if response.stop_reason != "tool_use":
                 break
-            # 执行工具调用
+
+            # -- 工具执行 --
             results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    # _exec 负责 dispatch，会自动绑定 sender 为当前队友名字
                     output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")  # 控制台可见队友活动
+                    # 控制台打印队友活动，带 [{name}] 前缀以区分不同队友的输出
+                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # s10: 队友批准 shutdown 后标记退出（不立即 break，先提交 tool_result）
+                    if block.name == "shutdown_response" and args_approve(block.input):
+                        should_exit = True
             messages.append({"role": "user", "content": results})
-        # 循环结束，标记为 idle（可被重新 spawn）
+
+        # -- 循环结束：更新状态 --
+        # should_exit=True → shutdown（队友主动批准了关机）
+        # 其他情况 → idle（正常完成或达到上限）
         member = self._find_member(name)
-        if member and member["status"] != "shutdown":  # 如果不是被主动关机的
-            member["status"] = "idle"
+        if member:
+            member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        """队友的工具 dispatch。与全局 TOOL_HANDLERS 分开，因为 send_message/read_inbox
-        需要知道调用者身份（sender），lead 硬编码 "lead"，队友用自己的名字。"""
+        """队友的工具分发器。
+
+        为什么不直接复用 lead 的 TOOL_HANDLERS？
+        因为 send_message 和 read_inbox 需要知道"谁在调用"：
+        - lead 的 TOOL_HANDLERS 中 sender 硬编码为 "lead"
+        - 队友的 _exec 中 sender 是队友自己的名字
+        这样每个队友发消息时，收件人能看到是谁发的（msg["from"] 字段）
+
+        Args:
+            sender:    调用者名字（自动绑定，队友自己不需要指定）
+            tool_name: 工具名称
+            args:      工具参数（来自 LLM 的 tool_use block）
+        """
         if tool_name == "bash":
             return run_bash(args["command"])
         if tool_name == "read_file":
@@ -201,16 +457,57 @@ class TeammateManager:
         if tool_name == "edit_file":
             return edit_file(args["path"], args["old_text"], args["new_text"])
         if tool_name == "send_message":
-            # sender 自动绑定为当前队友名字
+            # sender 自动绑定为当前队友名字，队友不能伪装成别人发消息
             return BUS.send(sender, args["to"], args["content"],
                             args.get("msg_type", "message"))
         if tool_name == "read_inbox":
-            return json.dumps(BUS.read_inbox(sender), indent=2)  # 读自己的收件箱
+            # 只能读自己的收件箱（sender），不能窥探别人的邮箱
+            return json.dumps(BUS.read_inbox(sender), indent=2)
+        # -- s10 协议工具 --
+        if tool_name == "shutdown_response":
+            # 队友回复 lead 的 shutdown 请求
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            # 通过邮箱通知 lead 审批结果
+            BUS.send(
+                sender, "lead", args.get("reason", ""),
+                "shutdown_response", {"request_id": req_id, "approve": approve},
+            )
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            # 队友提交计划给 lead 审批
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            # 通过邮箱发送计划给 lead
+            BUS.send(
+                sender, "lead", plan_text, "plan_approval_response",
+                {"request_id": req_id, "plan": plan_text},
+            )
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        """队友的工具集（6 个）：4 个基础工具 + 2 个通信工具。
-        比 lead 少：没有 spawn_teammate（不能生队友）、broadcast（只有 lead 能群发）、list_teammates。"""
+        """队友的工具 schema 定义（8 个工具）。
+
+        工具集对比：
+          Lead（PARENT_AGENT_TOOLS）: 基础 4 + todo + load_skill + compact + task 4
+                                      + subagent + background 2 + 团队 8 = 21 个
+          队友（_teammate_tools）:     基础 4 + 通信 2 + 协议 2 = 8 个
+
+        队友没有的工具（及原因）：
+          - spawn_teammate:   只有 lead 能创建队友（防止队友无限繁殖）
+          - broadcast:        只有 lead 能群发（层级通信模型）
+          - list_teammates:   队友不需要知道全局团队结构
+          - shutdown_request: 只有 lead 能发起关机请求
+          - todo/task_*:      队友任务简单，不需要复杂的任务管理
+          - compact:          队友生命周期短（最多 50 轮），不需要压缩
+          - background_run:   队友本身就是后台运行的
+        """
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -224,10 +521,18 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+            # -- s10 协议工具 --
+            {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
+             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
         ]
 
     def list_all(self) -> str:
-        """列出所有队友及状态，供 /team 命令和 list_teammates 工具使用。"""
+        """列出所有队友及状态。被两个地方调用：
+        1. /team 调试命令（直接打印，不经过 LLM）
+        2. list_teammates 工具（通过 TOOL_HANDLERS，LLM 可见）
+        """
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -236,23 +541,36 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
-        """返回所有队友名字列表，供 broadcast 使用。"""
+        """返回所有队友名字列表，供 broadcast() 遍历使用。"""
         return [m["name"] for m in self.config["members"]]
 
 
-TEAM = TeammateManager(TEAM_DIR)  # 全局单例
-KEEP_RECENT = 3
-TRANSCRIPT_DIR = Path.cwd() / ".transcripts"
+# 全局队友管理器单例
+TEAM = TeammateManager(TEAM_DIR)
+# ============================================================
+# 上下文管理（三层压缩策略）
+# ============================================================
+# Layer 1: micro_compact — 每轮执行，替换旧 tool_result 为占位符
+# Layer 2: auto_compact  — token 超阈值时，LLM 摘要压缩整个对话
+# Layer 3: manual compact — LLM 主动调用 compact 工具触发压缩
+
+KEEP_RECENT = 3  # micro_compact 保留最近 N 个 tool_result 不压缩
+TRANSCRIPT_DIR = Path.cwd() / ".transcripts"  # auto_compact 前保存完整对话的目录
 
 
 def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
+    """粗略估算 token 数：将整个 messages 序列化为字符串，除以 4。
+    精确度不高但够用，避免引入 tokenizer 依赖。"""
     return len(str(messages)) // 4
 
 
 def micro_compact(messages: list):
-    """Layer 1: Replace old tool_result content with short placeholders.
-    Runs every turn, keeps only the last KEEP_RECENT results intact."""
+    """Layer 1 上下文压缩：替换旧的 tool_result 为短占位符。
+
+    策略：每轮都运行，只保留最近 KEEP_RECENT 个 tool_result 完整，
+    更早的 tool_result 如果超过 100 字符就替换为 "[Previous: used {tool_name}]"。
+    这样 LLM 仍然知道之前用了什么工具，但不会被大量输出填满上下文。
+    """
     # Collect all tool_result entries with their positions
     tool_results = []
     for msg_idx, msg in enumerate(messages):
@@ -279,7 +597,15 @@ def micro_compact(messages: list):
             result["content"] = f"[Previous: used {tool_name}]"
 
 def auto_compact(messages: list) -> list:
-    """Layer 2: Save full transcript to disk, then LLM-summarize and replace all messages."""
+    """Layer 2 上下文压缩：先保存完整对话到磁盘，再用 LLM 生成摘要替换全部历史。
+
+    流程：
+    1. 将完整 messages 以 JSONL 格式保存到 .transcripts/ 目录（保留现场）
+    2. 将对话文本截断到 80K 字符，发给 LLM 请求摘要
+    3. 用 [压缩摘要 + 虚拟 assistant 回复] 替换原来的所有 messages
+
+    返回值：压缩后的 messages 列表（只有 2 条消息）
+    """
     # Save full transcript
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
@@ -305,9 +631,20 @@ def auto_compact(messages: list) -> list:
     ]
 
 
+# ============================================================
+# 子智能体（s04，与 s10 队友不同的并行模型）
+# ============================================================
+# 子智能体：同步阻塞调用，共享 TOOL_HANDLERS，用完即弃，不能通信
+# 队友：    异步线程，独立工具集，有持久身份，通过 MessageBus 通信
 SUBAGENT_SYSTEM = f"""You are a coding subagent at {os.getcwd()}.
 Complete the given task, then summarize your findings."""
 
+# ============================================================
+# 工具注册表 — Lead 的工具分发
+# ============================================================
+# 每个 key 是工具名，value 是对应的 handler 函数
+# LLM 返回 tool_use block 后，agent_loop 通过 TOOL_HANDLERS[block.name] 找到 handler 并调用
+# **_ 用于忽略 LLM 传入的额外参数（容错处理）
 TOOL_HANDLERS = {
     "bash": lambda command, **_:run_bash(command),
     "read_file": lambda path, limit=None, **_:read_file(path, limit),
@@ -323,14 +660,27 @@ TOOL_HANDLERS = {
     "task_get": lambda task_id, **_: TASKS.get(task_id),
     "background_run": lambda command, **_: BG.run(command),
     "check_background": lambda task_id=None, **_: BG.check(task_id),
-    # -- s09: 团队工具（lead 视角，sender 硬编码为 "lead"）--
-    "spawn_teammate": lambda name, role, prompt, **_: TEAM.spawn(name, role, prompt),
-    "list_teammates": lambda **_: TEAM.list_all(),
-    "send_message": lambda to, content, msg_type="message", **_: BUS.send("lead", to, content, msg_type),  # lead 发消息
-    "read_inbox": lambda **_: json.dumps(BUS.read_inbox("lead"), indent=2),  # 只读 lead 自己的收件箱
-    "broadcast": lambda content, **_: BUS.broadcast("lead", content, TEAM.member_names()),  # 群发给所有队友
+    # -- 团队工具（s10 新增，lead 视角）--
+    # 注意：这里所有 sender 都硬编码为 "lead"
+    # 队友的 sender 绑定在 TeammateManager._exec() 中处理
+    "spawn_teammate": lambda name, role, prompt, **_: TEAM.spawn(name, role, prompt),  # 创建队友线程
+    "list_teammates": lambda **_: TEAM.list_all(),                                       # 查看团队名册
+    "send_message": lambda to, content, msg_type="message", **_: BUS.send("lead", to, content, msg_type),  # lead → 队友
+    "read_inbox": lambda **_: json.dumps(BUS.read_inbox("lead"), indent=2),              # 读 lead 自己的收件箱
+    "broadcast": lambda content, **_: BUS.broadcast("lead", content, TEAM.member_names()),  # lead → 全体队友
+    # -- s10 协议工具（lead 端）--
+    "shutdown_request": lambda teammate, **_: handle_shutdown_request(teammate),      # lead 发起关机请求
+    "shutdown_response": lambda request_id="", **_: check_shutdown_status(request_id),  # lead 查看关机状态
+    "plan_approval": lambda request_id, approve, feedback="", **_: handle_plan_review(request_id, approve, feedback),  # lead 审批计划
 }
 
+# ============================================================
+# 工具 Schema 定义 — 告诉 LLM 有哪些工具可用
+# ============================================================
+# Claude API 要求用 JSON Schema 格式描述每个工具的 name、description、input_schema
+# LLM 看到这些定义后会选择合适的工具并生成参数
+
+# 子智能体和队友的工具集（基础工具 + todo + skill + compact + task 管理）
 CHILD_AGENT_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -356,6 +706,8 @@ CHILD_AGENT_TOOLS = [
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
 
+# Lead 的完整工具集 = 子智能体工具 + subagent + background + 团队管理 5 个
+# 使用列表拼接（+）而非重新定义，确保基础工具定义只维护一份
 PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
@@ -363,7 +715,9 @@ PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
      "input_schema": {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to run in background"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check status and output of background tasks. Pass task_id for details, or omit for overview.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Background task ID to check (omit for all)"}}}},
-    # -- s09: 团队工具定义，让 LLM 知道可以调用 --
+    # -- 团队工具 schema 定义（s10 新增）--
+    # 这 5 个工具只出现在 PARENT_AGENT_TOOLS 中（仅 lead 可用）
+    # 队友的工具集在 TeammateManager._teammate_tools() 中单独定义
     {"name": "spawn_teammate", "description": "Spawn a persistent teammate that runs its own agent loop in a thread.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
     {"name": "list_teammates", "description": "List all teammates with name, role, status.",
@@ -374,6 +728,13 @@ PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    # -- s10 协议工具 schema（仅 lead 可用）--
+    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+    {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
 ]
 
 TODO = None  # global singleton, initialized below
@@ -381,8 +742,17 @@ TODO = None  # global singleton, initialized below
 TASKS_DIR = Path.cwd() / ".tasks"
 
 
+# ============================================================
+# 持久化任务管理 (s07)
+# ============================================================
+
 class TaskManager:
-    """Persistent task graph (DAG). Each task is a JSON file in .tasks/."""
+    """持久化任务 DAG（有向无环图）。每个任务是 .tasks/ 目录下的一个 JSON 文件。
+
+    与 TodoManager 的区别：
+    - TaskManager：持久化到磁盘，支持依赖关系，能跨会话和压缩存活
+    - TodoManager：纯内存，无依赖，会话结束即丢失
+    """
 
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -463,7 +833,27 @@ class TaskManager:
 
 TASKS = TaskManager(TASKS_DIR)
 
+# ============================================================
+# 技能系统 (s05)
+# ============================================================
+
 class SKILL_LOADER:
+    """从 skills/ 目录加载 SKILL.md 文件，提供技能目录和按需加载功能。
+
+    技能文件格式（SKILL.md）：
+      ---
+      name: git-expert
+      description: Git 高级操作指南
+      tags: git, version-control
+      ---
+      （技能正文，Markdown 格式）
+
+    使用方式：
+    1. 启动时 _load_all() 扫描所有 SKILL.md，解析 frontmatter
+    2. get_descriptions() 返回技能目录（注入 system prompt，让 LLM 知道有哪些技能）
+    3. LLM 调用 load_skill 工具时，get_content() 返回技能正文
+    """
+
     def __init__(self, skills_dir: Path):
         print(f"Loading skills from {skills_dir}")
         self.skills = {}
@@ -514,6 +904,7 @@ class SKILL_LOADER:
         return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
 
 def run_subagent(prompt: str) -> str:
+    """同步运行一次性子智能体（s04）。阻塞 lead 直到完成。最多 30 轮 LLM 调用。"""
     sub_messages = [{"role": "user", "content": prompt}]
     for _ in range(30):
         response = client.messages.create(
@@ -536,7 +927,14 @@ def run_subagent(prompt: str) -> str:
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
+# ============================================================
+# 内存待办列表 (s02)
+# ============================================================
+
 class TodoManager:
+    """轻量级内存待办列表。会话结束即丢失，适合短期任务跟踪。
+    限制：最多 20 条，同时只能有 1 条 in_progress。"""
+
     def __init__(self):
         self.items = []
 
@@ -571,14 +969,27 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+# ============================================================
+# 后台任务管理 (s08)
+# ============================================================
+
 class BackgroundManager:
-    """Non-blocking command execution via daemon threads."""
+    """非阻塞命令执行器。在 daemon 线程中运行 shell 命令，完成后推送通知。
+
+    与队友线程的区别：
+    - BackgroundManager：运行 shell 命令，无 LLM 推理能力
+    - TeammateManager：  运行完整 agent loop，有 LLM 推理能力
+
+    通知机制：
+    - 命令完成后将结果推入 _notifications 队列
+    - agent_loop 每轮开头调用 drain_notifications() 取出通知注入上下文
+    """
 
     def __init__(self, timeout: int = 300):
-        self.timeout = timeout
-        self._tasks: dict[str, dict] = {}
-        self._notifications: queue.Queue = queue.Queue()
-        self._lock = threading.Lock()
+        self.timeout = timeout                         # 单个命令最大执行时间（秒）
+        self._tasks: dict[str, dict] = {}              # task_id → 任务状态字典
+        self._notifications: queue.Queue = queue.Queue()  # 完成通知队列
+        self._lock = threading.Lock()                  # 保护 _tasks 字典的并发访问
 
     def run(self, command: str) -> str:
         task_id = uuid.uuid4().hex[:8]
@@ -648,13 +1059,20 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
+# ============================================================
+# 基础工具实现
+# ============================================================
+
 def safe_path(path: str) -> Path:
+    """路径安全检查：确保解析后的路径不会逃逸出工作目录。
+    例如 "../../../etc/passwd" 会被拦截。"""
     path = (Path(os.getcwd()) / path).resolve()
     if not path.is_relative_to(Path(os.getcwd())):
         raise ValueError(f"Path escapes workspace: {path}")
     return path
 
 def run_bash(command: str) -> str:
+    """执行 shell 命令并返回 stdout+stderr。有基础的危险命令黑名单。"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -698,7 +1116,13 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-TODO = TodoManager()
-SKILLS_DIR = Path(os.getcwd()) / "skills"
-SKILL_LOADER = SKILL_LOADER(SKILLS_DIR) 
+# ============================================================
+# 全局单例初始化
+# ============================================================
+# 这些单例在模块加载时创建，整个进程共享
+# 注意初始化顺序：SKILL_LOADER 最后，因为它在 __init__ 中读磁盘并打印日志
+
+TODO = TodoManager()                        # 内存待办列表
+SKILLS_DIR = Path(os.getcwd()) / "skills"   # 技能文件目录
+SKILL_LOADER = SKILL_LOADER(SKILLS_DIR)     # 技能加载器（启动时扫描 skills/）
 
