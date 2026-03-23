@@ -3,10 +3,12 @@ tools.py — Agent 工具集
 
 本文件包含 agent 可用的所有工具实现，按功能分为几大模块：
 
-1. 团队协作（s10 新增）
+1. 团队协作（s10 新增，s11 增强）
    - MessageBus      — 基于 JSONL 文件的异步消息系统
-   - TeammateManager — 队友生命周期管理（spawn/idle/shutdown）
+   - TeammateManager — 队友生命周期管理（spawn/work/idle/shutdown）
    核心设计：队友在独立线程中运行完整的 agent loop，通过邮箱与 lead 通信
+   s11 增强：队友完成工作后进入空闲循环，自动轮询任务板认领新任务
+            身份重注入确保压缩后 LLM 不会忘记自己是谁
 
 2. 上下文管理
    - micro_compact   — 细粒度压缩：替换旧 tool_result 为占位符
@@ -99,6 +101,17 @@ VALID_MSG_TYPES = {
 shutdown_requests: dict[str, dict] = {}  # {request_id: {"target": name, "status": "pending|approved|rejected"}}
 plan_requests: dict[str, dict] = {}      # {request_id: {"from": name, "plan": text, "status": "pending|approved|rejected"}}
 _tracker_lock = threading.Lock()          # 保护上述两个字典的并发访问（lead 线程和队友线程都可能读写）
+_claim_lock = threading.Lock()            # s11: 保护 claim_task 的原子性（防止两个队友同时认领同一个任务）
+
+# ============================================================
+# s11 自治空闲循环参数
+# ============================================================
+# 队友完成当前工作后，进入 IDLE 阶段，每隔 POLL_INTERVAL 秒检查：
+#   1. 收件箱是否有新消息（lead 或其他队友发来的）
+#   2. 任务板（.tasks/）是否有未认领的任务
+# 如果超过 IDLE_TIMEOUT 秒仍无新工作，队友自动关机
+POLL_INTERVAL = 5   # 空闲轮询间隔（秒）
+IDLE_TIMEOUT = 60   # 空闲超时（秒）
 
 
 class MessageBus:
@@ -257,6 +270,75 @@ def args_approve(input_dict: dict) -> bool:
     return input_dict.get("approve", False)
 
 
+# ============================================================
+# s11 自治任务板扫描与认领
+# ============================================================
+#
+# 核心理念："The agent finds work itself."（队友自己找活干）
+#
+# 传统模式：lead 分配任务 → 队友执行 → 完成后等待新指令
+# s11 模式：lead 分配任务 → 队友执行 → 完成后主动扫描任务板 → 找到新任务自动认领
+#
+# 认领条件（三个都满足才算"可认领"）：
+#   1. status == "pending"    — 任务尚未开始
+#   2. owner 为空             — 没有人认领
+#   3. blockedBy 为空         — 没有前置依赖阻塞
+
+def scan_unclaimed_tasks() -> list:
+    """扫描任务板，返回所有可自动认领的任务列表。
+    按文件名排序确保多个队友看到的顺序一致，配合 _claim_lock 实现先到先得。"""
+    TASKS_DIR.mkdir(exist_ok=True)
+    unclaimed = []
+    for f in sorted(TASKS_DIR.glob("task_*.json")):
+        task = json.loads(f.read_text())
+        if (task.get("status") == "pending"
+                and not task.get("owner")
+                and not task.get("blockedBy")):
+            unclaimed.append(task)
+    return unclaimed
+
+
+def claim_task(task_id: int, owner: str) -> str:
+    """原子性地认领一个任务：设置 owner 和 status=in_progress。
+
+    使用 _claim_lock 确保并发安全：
+    - 队友 A 和队友 B 同时看到 task_1 未认领
+    - A 先拿到锁，认领成功
+    - B 拿到锁后发现 owner 已设置，认领失败
+    """
+    with _claim_lock:
+        path = TASKS_DIR / f"task_{task_id}.json"
+        if not path.exists():
+            return f"Error: Task {task_id} not found"
+        task = json.loads(path.read_text())
+        if task.get("owner"):
+            return f"Error: Task {task_id} already claimed by {task['owner']}"
+        task["owner"] = owner
+        task["status"] = "in_progress"
+        path.write_text(json.dumps(task, indent=2))
+    return f"Claimed task #{task_id} for {owner}"
+
+
+def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    """生成身份重注入消息块（s11）。
+
+    使用场景：队友在 IDLE 阶段自动认领新任务时，如果对话历史很短
+    （len(messages) <= 3），说明之前的对话可能经历了压缩，LLM 可能忘记了
+    自己的身份。此时在对话开头插入 identity_block，确保 LLM 记住：
+      - 自己叫什么名字（name）
+      - 自己的角色是什么（role）
+      - 属于哪个团队（team_name）
+
+    格式：用 <identity> XML 标签包裹，与普通用户消息区分。
+    配合 messages 中紧随其后的 assistant 伪回复 "I am {name}. Continuing."
+    形成完整的 user-assistant 对，满足 Claude API 交替要求。
+    """
+    return {
+        "role": "user",
+        "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
+    }
+
+
 class TeammateManager:
     """持久化队友管理器。维护团队名册（config.json）并在线程中运行队友 agent loop。
 
@@ -305,6 +387,15 @@ class TeammateManager:
                 return m
         return None
 
+    def _set_status(self, name: str, status: str):
+        """更新队友状态并持久化到 config.json（s11 新增）。
+        在空闲循环中频繁切换状态（working ↔ idle），
+        抽成方法避免重复代码。"""
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            self._save_config()
+
     def spawn(self, name: str, role: str, prompt: str) -> str:
         """创建队友并在独立线程中启动 agent loop。
 
@@ -346,93 +437,179 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        """队友的完整 agent loop（在独立线程中运行）。
+        """队友的完整 agent loop，带自治空闲循环（s11 增强）。
 
-        与 lead 的 agent_loop 结构相同：
-          while True:
-              response = LLM(messages, tools)
-              execute tools
-              append results
+        s11 之前的生命周期（s10）：
+          spawn → WORK（最多 50 轮）→ idle/shutdown → 结束
 
-        关键差异：
-        1. 独立的 messages[] — 不污染 lead 的对话历史
-        2. 精简的工具集 — 8 个工具（4 基础 + 2 通信 + 2 协议），没有 spawn_teammate/broadcast
-        3. 最多 50 轮 — 硬性上限防止失控（lead 没有此限制，靠 stop_reason 自然结束）
-        4. 每轮开头 drain 自己的收件箱 — 接收 lead 或其他队友的消息
-        5. 没有 micro_compact/auto_compact — 队友生命周期短，不需要压缩
-        6. should_exit 标志 — 队友批准 shutdown 后，完成当前轮次的 tool_result 提交后退出
+        s11 的生命周期（自治循环）：
+          spawn → WORK → IDLE → (resume WORK | shutdown)
+                    ↑______|
+
+        WORK 阶段（内循环，最多 50 轮 LLM 调用）：
+          - 每轮开头 drain 收件箱，接收消息
+          - 遇到 shutdown_request → 立即关机（快速路径）
+          - 队友调用 idle 工具 → 跳出到 IDLE 阶段
+          - 队友批准 shutdown_response → 标记退出
+          - LLM 返回纯文本（无工具调用）→ 跳出到 IDLE 阶段
+
+        IDLE 阶段（s11 核心机制）：
+          每隔 POLL_INTERVAL 秒检查：
+            1. 收件箱 → 有消息则恢复 WORK
+            2. 任务板 → 有未认领任务则自动认领，恢复 WORK
+          超过 IDLE_TIMEOUT 秒无工作 → 自动关机
+
+        身份重注入（s11 新增）：
+          自动认领任务后，如果对话历史很短（≤3 条），说明经历了压缩。
+          此时在对话开头插入 identity_block，确保 LLM 记住自己是谁。
+
+        关键设计决策：
+          - idle 工具不走 _exec，直接标记 idle_requested（避免副作用）
+          - shutdown_request 在 inbox drain 时直接处理（快速路径，不等 LLM 决定）
+          - should_exit 标志延迟一轮生效（让 LLM 看到 shutdown_response 的结果）
         """
-        # 每个队友有独立的 system prompt，包含自己的名字和角色
-        # s10: 告知队友两个协议：提交计划需审批，收到 shutdown_request 需回复
+        team_name = self.config["team_name"]
+        # s11: system prompt 增加 "Use idle tool" 和 "auto-claim" 提示
+        # 告诉队友它有自治能力：没活干时用 idle 工具进入空闲，系统会自动分配新任务
         sys_prompt = (
-            f"You are '{name}', role: {role}, at {Path.cwd()}. "
+            f"You are '{name}', role: {role}, team: {team_name}, at {Path.cwd()}. "
+            f"Use idle tool when you have no more work. You will auto-claim new tasks. "
             f"Submit plans via plan_approval before major work. "
             f"Respond to shutdown_request with shutdown_response."
         )
-        messages = [{"role": "user", "content": prompt}]  # 独立对话历史，初始消息就是任务
-        tools = self._teammate_tools()                     # 精简工具集（8 个）
+        messages = [{"role": "user", "content": prompt}]
+        tools = self._teammate_tools()
 
-        # s10: should_exit 标志 — 队友调用 shutdown_response(approve=True) 后设置
-        # 不立即 break，而是先让当前轮次的所有 tool_result 正常提交给 LLM
-        # 然后在下一轮循环开头 break（这样 LLM 能看到 shutdown_response 的结果）
-        should_exit = False
+        # ===== 外循环：WORK → IDLE → WORK → ... =====
+        # s11 核心改造：从单次 for 循环变为 while True 自治循环
+        while True:
+            # ===== WORK 阶段：标准 agent loop =====
+            should_exit = False    # s10 协议：队友批准 shutdown 后设置
+            idle_requested = False  # s11 新增：队友调用 idle 工具后设置
 
-        for _ in range(50):  # 硬性上限：最多 50 轮 LLM 调用
-            # -- 收件箱检查 --
-            # 每轮开头 drain 自己的收件箱
-            # 注意：这里直接追加为 user 消息，没有像 lead 那样用 <inbox> 标签包裹
-            # 因为队友的上下文更简单，不需要额外区分
-            inbox = BUS.read_inbox(name)
-            for msg in inbox:
-                messages.append({"role": "user", "content": json.dumps(msg)})
+            for _ in range(50):  # 硬性上限：每次 WORK 阶段最多 50 轮 LLM 调用
+                # -- 收件箱检查 --
+                inbox = BUS.read_inbox(name)
+                for msg in inbox:
+                    # s11: shutdown_request 快速路径
+                    # 不等 LLM 决定是否 approve，直接关机
+                    # 与 s10 的 shutdown_response 协议互补：
+                    #   快速路径：inbox drain 时发现 shutdown_request → 立即退出
+                    #   协议路径：LLM 收到 shutdown_request → 调用 shutdown_response → 延迟退出
+                    if msg.get("type") == "shutdown_request":
+                        self._set_status(name, "shutdown")
+                        return
+                    messages.append({"role": "user", "content": json.dumps(msg)})
 
-            # s10: 如果上一轮已经批准了 shutdown，在处理完收件箱后退出
+                # s10: 如果上一轮已经批准了 shutdown，在处理完收件箱后退出
+                if should_exit:
+                    break
+
+                # -- LLM 调用 --
+                try:
+                    response = client.messages.create(
+                        model=MODEL,
+                        system=sys_prompt,
+                        messages=messages,
+                        tools=tools,
+                        max_tokens=8000,
+                    )
+                except Exception:
+                    # API 异常（网络错误、限流等）→ 安全退出整个循环
+                    self._set_status(name, "idle")
+                    return
+
+                messages.append({"role": "assistant", "content": response.content})
+
+                # 模型返回纯文本（不再调用工具）→ 当前工作完成，跳出到 IDLE 阶段
+                if response.stop_reason != "tool_use":
+                    break
+
+                # -- 工具执行 --
+                results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "idle":
+                            # s11: idle 工具不走 _exec，直接标记进入空闲阶段
+                            # 设计原因：idle 是状态转换信号，不是真正的"工具"
+                            idle_requested = True
+                            output = "Entering idle phase. Will poll for new tasks."
+                        else:
+                            output = self._exec(name, block.name, block.input)
+                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
+                        # s10: 队友批准 shutdown 后标记退出
+                        if block.name == "shutdown_response" and args_approve(block.input):
+                            should_exit = True
+                messages.append({"role": "user", "content": results})
+
+                # s11: idle 工具被调用 → 跳出 WORK 阶段，进入 IDLE 阶段
+                if idle_requested:
+                    break
+
+            # -- WORK 阶段结束判定 --
+            # should_exit=True → 队友主动批准了关机，不进入 IDLE 阶段
             if should_exit:
-                break
+                self._set_status(name, "shutdown")
+                return
 
-            # -- LLM 调用 --
-            try:
-                response = client.messages.create(
-                    model=MODEL,
-                    system=sys_prompt,
-                    messages=messages,
-                    tools=tools,
-                    max_tokens=8000,
-                )
-            except Exception:  # API 异常（网络错误、限流等）则安全退出
-                break
+            # ===== IDLE 阶段：轮询任务板和收件箱 =====
+            # s11 核心："The agent finds work itself."
+            # 队友不是被动等待 lead 分配，而是主动寻找工作
+            self._set_status(name, "idle")
+            resume = False
+            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)  # 总轮询次数（60/5=12 次）
 
-            messages.append({"role": "assistant", "content": response.content})
+            for _ in range(polls):
+                time.sleep(POLL_INTERVAL)
 
-            # 模型返回纯文本（不再调用工具）→ 任务完成，退出循环
-            if response.stop_reason != "tool_use":
-                break
+                # -- 检查 1: 收件箱 --
+                # 有人给我发消息了吗？（可能是新任务指令、shutdown 请求等）
+                inbox = BUS.read_inbox(name)
+                if inbox:
+                    for msg in inbox:
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                        messages.append({"role": "user", "content": json.dumps(msg)})
+                    resume = True
+                    break
 
-            # -- 工具执行 --
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    # _exec 负责 dispatch，会自动绑定 sender 为当前队友名字
-                    output = self._exec(name, block.name, block.input)
-                    # 控制台打印队友活动，带 [{name}] 前缀以区分不同队友的输出
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    })
-                    # s10: 队友批准 shutdown 后标记退出（不立即 break，先提交 tool_result）
-                    if block.name == "shutdown_response" and args_approve(block.input):
-                        should_exit = True
-            messages.append({"role": "user", "content": results})
+                # -- 检查 2: 任务板 --
+                # .tasks/ 目录中有没有未认领的任务？
+                unclaimed = scan_unclaimed_tasks()
+                if unclaimed:
+                    task = unclaimed[0]  # 取第一个（按文件名排序）
+                    claim_task(task["id"], name)
+                    task_prompt = (
+                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                        f"{task.get('description', '')}</auto-claimed>"
+                    )
+                    # -- s11 身份重注入 --
+                    # 如果对话历史很短（≤3 条消息），可能经历了压缩
+                    # LLM 可能已经忘记自己的名字和角色
+                    # 在对话开头插入 identity_block + 伪 assistant 回复
+                    # 这样 LLM 重新"记住"自己是谁
+                    if len(messages) <= 3:
+                        messages.insert(0, make_identity_block(name, role, team_name))
+                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                    messages.append({"role": "user", "content": task_prompt})
+                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                    resume = True
+                    break
 
-        # -- 循环结束：更新状态 --
-        # should_exit=True → shutdown（队友主动批准了关机）
-        # 其他情况 → idle（正常完成或达到上限）
-        member = self._find_member(name)
-        if member:
-            member["status"] = "shutdown" if should_exit else "idle"
-            self._save_config()
+            # -- IDLE 阶段结束判定 --
+            if not resume:
+                # 轮询超时：连续 IDLE_TIMEOUT 秒没找到任何工作 → 自动关机
+                self._set_status(name, "shutdown")
+                return
+
+            # 有新工作 → 回到 WORK 阶段
+            self._set_status(name, "working")
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         """队友的工具分发器。
@@ -489,15 +666,24 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+        # -- s11 新增工具 --
+        if tool_name == "claim_task":
+            # 队友手动认领任务（补充自动认领：LLM 主动选择要做哪个任务）
+            return claim_task(args["task_id"], sender)
+        # idle 工具在 _teammate_loop 中特殊处理，不会走到 _exec
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        """队友的工具 schema 定义（8 个工具）。
+        """队友的工具 schema 定义（10 个工具，s11 从 8 个增加到 10 个）。
 
         工具集对比：
           Lead（PARENT_AGENT_TOOLS）: 基础 4 + todo + load_skill + compact + task 4
-                                      + subagent + background 2 + 团队 8 = 21 个
-          队友（_teammate_tools）:     基础 4 + 通信 2 + 协议 2 = 8 个
+                                      + subagent + background 2 + 团队 8 + s11 2 = 23 个
+          队友（_teammate_tools）:     基础 4 + 通信 2 + 协议 2 + s11 2 = 10 个
+
+        s11 新增的 2 个工具：
+          - idle:       队友主动宣告"我没活了"，触发 IDLE 轮询阶段
+          - claim_task: 队友手动认领任务板上的任务（补充自动认领）
 
         队友没有的工具（及原因）：
           - spawn_teammate:   只有 lead 能创建队友（防止队友无限繁殖）
@@ -526,6 +712,11 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+            # -- s11 新增工具 --
+            {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase where you will auto-claim new tasks.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
 
     def list_all(self) -> str:
@@ -672,6 +863,9 @@ TOOL_HANDLERS = {
     "shutdown_request": lambda teammate, **_: handle_shutdown_request(teammate),      # lead 发起关机请求
     "shutdown_response": lambda request_id="", **_: check_shutdown_status(request_id),  # lead 查看关机状态
     "plan_approval": lambda request_id, approve, feedback="", **_: handle_plan_review(request_id, approve, feedback),  # lead 审批计划
+    # -- s11 新增工具 --
+    "idle": lambda **_: "Lead does not idle.",                   # lead 不需要空闲循环（由用户驱动）
+    "claim_task": lambda task_id, **_: claim_task(task_id, "lead"),  # lead 也可以手动认领任务
 }
 
 # ============================================================
@@ -735,6 +929,11 @@ PARENT_AGENT_TOOLS = CHILD_AGENT_TOOLS + [
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
     {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+    # -- s11 新增工具 schema --
+    {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "claim_task", "description": "Claim a task from the board by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
 
 TODO = None  # global singleton, initialized below

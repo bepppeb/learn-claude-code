@@ -28,6 +28,14 @@ s10 (Team) 扩展：
 - 后台任务完成通知通过 <background-results> 标签注入
 - 新增 /team 和 /inbox 调试命令，方便观察团队状态
 
+s11 (Autonomous Agents) 扩展：
+- 队友完成工作后进入 IDLE 阶段，自动轮询任务板和收件箱
+- 新增 idle 工具，队友主动宣告"没活了"，进入空闲轮询
+- 新增 claim_task 工具，队友手动认领任务板上的任务
+- 自动认领：IDLE 阶段扫描 .tasks/ 目录中未认领的 pending 任务
+- 身份重注入：自动认领后如果上下文很短，插入 identity_block
+- 新增 /tasks 调试命令，查看任务板状态
+
 整体架构：
     +---------+
     |  User   |
@@ -54,11 +62,14 @@ from settings import client, MODEL
 
 # -- System Prompt --
 # s10: 角色从 "coding agent" 升级为 "team lead"
+# s11: 增加自治队友说明 — 队友会自己找活干，不需要 lead 持续推送任务
 # 关键设计决策：
 # 1. 告诉 LLM 它是团队领导，让它知道可以分配工作给队友
 # 2. 列出所有可用技能，让 LLM 能选择 load_skill 来获取专业知识
 # 3. 通信三件套：send_message（点对点）、read_inbox（收件箱）、broadcast（群发）
+# 4. s11: 告知 lead 队友是自治的，空闲时会自动从任务板认领任务
 SYSTEM = f"""You are a team lead at {os.getcwd()}.
+Teammates are autonomous -- they find work themselves from the task board.
 Use task_create/task_update/task_list for multi-step work — tasks persist to disk and survive compression.
 Use the todo tool for quick in-memory checklists within a single session.
 Prefer tools over prose.
@@ -209,6 +220,21 @@ if __name__ == "__main__":
         # 注意：read_inbox 是 drain-on-read 的，调用后收件箱会被清空
         if query.strip() == "/inbox":
             print(json.dumps(tools.BUS.read_inbox("lead"), indent=2))
+            continue
+
+        # /tasks（s11 新增）：查看任务板状态
+        # 遍历 .tasks/ 目录中的所有 task_*.json 文件
+        # 输出格式：
+        #   [ ] #1: 写单元测试              — pending，未认领
+        #   [>] #2: 重构认证模块 @alice     — in_progress，alice 认领了
+        #   [x] #3: 修复登录 bug @bob       — completed，bob 完成了
+        if query.strip() == "/tasks":
+            tools.TASKS_DIR.mkdir(exist_ok=True)
+            for f in sorted(tools.TASKS_DIR.glob("task_*.json")):
+                t = json.loads(f.read_text())
+                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+                owner = f" @{t['owner']}" if t.get("owner") else ""
+                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
 
         # 正常用户输入：追加到历史，交给 agent_loop 处理
