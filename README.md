@@ -237,3 +237,4 @@ MIT
 **The model is the agent. Our job is to give it tools and stay out of the way.**
 
 # 这是在 main worktree 中添加的内容
+# 这是在 feature-demo worktree 中添加的内容
