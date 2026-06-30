@@ -36,6 +36,14 @@ s11 (Autonomous Agents) 扩展：
 - 身份重注入：自动认领后如果上下文很短，插入 identity_block
 - 新增 /tasks 调试命令，查看任务板状态
 
+s12 (Worktree Task Isolation) 扩展：
+- 每个任务可绑定独立 git worktree 目录，实现目录级隔离
+- 控制面（.tasks/）管"做什么"，执行面（.worktrees/）管"在哪做"
+- worktree 生命周期事件写入 .worktrees/events.jsonl（可观测性）
+- remove 前检查未提交改动，防止丢代码
+- 修正状态转换：仅在有 owner 时才推进 in_progress（不是绑定 worktree 就推进）
+- 新增 /worktrees 和 /events 调试命令
+
 整体架构：
     +---------+
     |  User   |
@@ -75,6 +83,9 @@ Use the todo tool for quick in-memory checklists within a single session.
 Prefer tools over prose.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Spawn teammates for parallel work. Communicate via send_message/read_inbox/broadcast.
+For parallel or risky changes: create tasks, allocate worktree lanes via worktree_create,
+run commands in those lanes via worktree_run, then choose worktree_keep/worktree_remove for closeout.
+Use worktree_events when you need lifecycle visibility.
 
 Skills available:
 {tools.SKILL_LOADER.get_descriptions()}
@@ -234,7 +245,18 @@ if __name__ == "__main__":
                 t = json.loads(f.read_text())
                 marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
                 owner = f" @{t['owner']}" if t.get("owner") else ""
-                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
+                wt = f" wt={t['worktree']}" if t.get("worktree") else ""
+                print(f"  {marker} #{t['id']}: {t['subject']}{owner}{wt}")
+            continue
+
+        # /worktrees（s12 新增）：查看所有 worktree 状态
+        if query.strip() == "/worktrees":
+            print(tools.WORKTREES.list_all())
+            continue
+
+        # /events（s12 新增）：查看最近的生命周期事件
+        if query.strip() == "/events":
+            print(tools.EVENTS.list_recent(10))
             continue
 
         # 正常用户输入：追加到历史，交给 agent_loop 处理
